@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-05
+
+### Added
+
+- Expanded test coverage: try_lock success, distinct names, heavy contention,
+  same-thread re-entry, blocking-until-released, valid/invalid names, error
+  display/source, Unix `with_path`, and Unix lock-file creation.
+- Added `tests/crash_recovery.rs` integration test for lock recovery after a
+  child process is forcibly terminated.
+
+### Fixed
+
+- Synchronised `Error::WouldBlock` `Display` text with its doc comment.
+
 ## [0.1.0] - 2026-07-05
 
 ### Added
