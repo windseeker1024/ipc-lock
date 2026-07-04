@@ -316,6 +316,8 @@ impl fmt::Debug for LockGuard {
 mod tests {
     use super::*;
     use std::env;
+    #[cfg(unix)]
+    use std::path::PathBuf;
     use std::process::{Child, Command};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -483,6 +485,161 @@ mod tests {
         Ok(())
     }
 
+    /// `try_lock` succeeds immediately when the lock is free.
+    #[test]
+    fn try_lock_succeeds_when_free() -> Result<()> {
+        let name = random_name();
+        let lock = Lock::new(&name)?;
+        let _guard = lock.try_lock()?;
+        Ok(())
+    }
+
+    /// Locks with different names are independent of each other.
+    #[test]
+    fn distinct_names_are_independent() -> Result<()> {
+        let name_a = random_name();
+        let name_b = random_name();
+
+        let a = Lock::new(&name_a)?;
+        let b = Lock::new(&name_b)?;
+
+        let _guard_a = a.lock()?;
+        let _guard_b = b.lock()?; // should not block, different OS keys
+        Ok(())
+    }
+
+    /// Many threads competing for the same lock must be mutually exclusive.
+    #[test]
+    fn concurrent_threads() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let name = random_name();
+        let lock = Lock::new(&name)?;
+        let counter = Arc::new(AtomicUsize::new(0));
+        const THREADS: usize = 10;
+        const ITERATIONS: usize = 100;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let lock = lock.clone();
+                let counter = Arc::clone(&counter);
+                thread::spawn(move || -> Result<()> {
+                    for _ in 0..ITERATIONS {
+                        let _guard = lock.lock()?;
+                        // Increment while holding the lock to guarantee
+                        // no lost updates.
+                        let prev = counter.load(Ordering::Relaxed);
+                        counter.store(prev + 1, Ordering::Relaxed);
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("thread panicked")
+                .expect("thread returned error");
+        }
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            THREADS * ITERATIONS,
+            "atomic counter should match total increments"
+        );
+        Ok(())
+    }
+
+    /// Heavier contention test: many threads repeatedly acquiring and releasing the
+    /// lock with no sleep. This is a regression guard against deadlocks or lost
+    /// wake-ups in the thread-gate / Condvar logic.
+    #[test]
+    fn heavy_contention() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let name = random_name();
+        let lock = Lock::new(&name)?;
+        let counter = Arc::new(AtomicUsize::new(0));
+        const THREADS: usize = 32;
+        const ITERATIONS: usize = 1_000;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let lock = lock.clone();
+                let counter = Arc::clone(&counter);
+                thread::spawn(move || -> Result<()> {
+                    for _ in 0..ITERATIONS {
+                        let _guard = lock.lock()?;
+                        let prev = counter.load(Ordering::Relaxed);
+                        counter.store(prev + 1, Ordering::Relaxed);
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("thread panicked")
+                .expect("thread returned error");
+        }
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            THREADS * ITERATIONS,
+            "counter should equal total increments after heavy contention"
+        );
+        Ok(())
+    }
+
+    /// A second `try_lock` from the same thread while a guard is live must fail
+    /// with `WouldBlock`. `Lock` is not re-entrant.
+    #[test]
+    fn try_lock_fails_while_held_by_same_thread() -> Result<()> {
+        let name = random_name();
+        let lock = Lock::new(&name)?;
+
+        let _guard = lock.lock()?;
+        assert!(
+            matches!(lock.try_lock(), Err(Error::WouldBlock)),
+            "same-thread re-entry should be rejected"
+        );
+        Ok(())
+    }
+
+    /// `lock()` blocks until the current holder releases the guard.
+    #[test]
+    fn lock_blocks_until_released() -> Result<()> {
+        let name = random_name();
+        let lock = Lock::new(&name)?;
+        let lock2 = lock.clone();
+
+        let guard = lock.lock()?;
+        let start = Instant::now();
+
+        let handle = thread::spawn(move || -> Result<Instant> {
+            let _g = lock2.lock()?; // blocks
+            Ok(Instant::now())
+        });
+
+        // Give the spawned thread time to start waiting.
+        thread::sleep(Duration::from_millis(50));
+        drop(guard);
+
+        let acquired_after = handle
+            .join()
+            .expect("thread panicked")
+            .expect("thread returned error");
+
+        assert!(
+            acquired_after >= start + Duration::from_millis(50),
+            "second thread should have blocked until the guard was dropped"
+        );
+        Ok(())
+    }
+
     // ── invalid names ─────────────────────────────────────────────────────────
 
     #[test]
@@ -495,6 +652,51 @@ mod tests {
         }
     }
 
+    /// Names containing spaces, dots, dashes, or underscores are accepted.
+    #[test]
+    fn valid_names() -> Result<()> {
+        for good in ["my app", "my-app", "my_app", "my.app", "123"] {
+            let lock = Lock::new(good)?;
+            let _guard = lock.try_lock()?;
+        }
+        Ok(())
+    }
+
+    // ── error display ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn error_display() {
+        assert_eq!(
+            Error::InvalidName.to_string(),
+            "invalid lock name: must be non-empty and contain no '\\0', '/', or '\\'"
+        );
+        assert_eq!(
+            Error::WouldBlock.to_string(),
+            "lock is currently held by another thread or process"
+        );
+        assert!(
+            Error::Io(io::Error::new(io::ErrorKind::Other, "boom"))
+                .to_string()
+                .contains("I/O error"),
+            "Io error should mention I/O"
+        );
+    }
+
+    /// Verify the `std::error::Error::source` implementation.
+    #[test]
+    fn error_source() {
+        use std::error::Error as StdError;
+
+        let io_err = io::Error::new(io::ErrorKind::Other, "boom");
+        let err = Error::Io(io_err);
+        assert!(
+            StdError::source(&err).is_some(),
+            "Io error should have a source"
+        );
+        assert!(StdError::source(&Error::InvalidName).is_none());
+        assert!(StdError::source(&Error::WouldBlock).is_none());
+    }
+
     // ── trait bounds ─────────────────────────────────────────────────────────
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -505,5 +707,56 @@ mod tests {
         assert_send_sync::<Lock>();
         assert_send_sync::<LockGuard>();
         assert_clone_debug::<Lock>();
+    }
+
+    // ── platform-specific tests ───────────────────────────────────────────────
+
+    /// Unix-only: `Lock::with_path` uses the supplied filesystem path.
+    #[cfg(unix)]
+    #[test]
+    fn unix_with_path() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("ipc-lock-test-{}", random_name()));
+        let a = Lock::with_path(&path)?;
+        let b = Lock::with_path(&path)?;
+
+        let _guard = a.try_lock()?;
+        assert!(
+            matches!(b.try_lock(), Err(Error::WouldBlock)),
+            "two handles for the same path should share state"
+        );
+
+        // Clean up the lock file; ignore errors if the OS already removed it.
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    /// Unix-only: `Lock::new` creates the backing lock file under `$TMPDIR`.
+    #[cfg(unix)]
+    #[test]
+    fn unix_lock_file_created() -> Result<()> {
+        let name = random_name();
+        let expected_path = std::env::var_os("TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(format!("{name}.lock"));
+
+        let lock = Lock::new(&name)?;
+        assert!(
+            expected_path.exists(),
+            "lock file should be created at {expected_path:?}"
+        );
+
+        // The library intentionally leaves the lock file in place; holding and
+        // dropping the guard should not remove it.
+        {
+            let _guard = lock.try_lock()?;
+        }
+        assert!(
+            expected_path.exists(),
+            "lock file should remain after the guard is dropped"
+        );
+
+        let _ = std::fs::remove_file(&expected_path);
+        Ok(())
     }
 }

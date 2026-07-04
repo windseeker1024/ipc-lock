@@ -26,7 +26,7 @@ impl fmt::Display for Error {
             Error::InvalidName => f.write_str(
                 "invalid lock name: must be non-empty and contain no '\\0', '/', or '\\'",
             ),
-            Error::WouldBlock => f.write_str("lock is currently held by another holder"),
+            Error::WouldBlock => f.write_str("lock is currently held by another thread or process"),
             Error::Io(e) => write!(f, "I/O error: {e}"),
         }
     }
