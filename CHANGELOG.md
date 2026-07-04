@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-05
+
+### Fixed
+
+- Added `#![cfg_attr(docsrs, feature(doc_cfg))]` so docs.rs can build the
+  `#[cfg_attr(docsrs, doc(cfg(unix)))]` annotation on `Lock::with_path`.
+
 ## [0.1.1] - 2026-07-05
 
 ### Added

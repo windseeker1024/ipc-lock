@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 //! Cross-process named locks.
 //!
 //! `ipc-lock` provides mutual exclusion that works across **both threads and
