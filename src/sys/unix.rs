@@ -7,6 +7,8 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::Path;
 
+use crate::sys::LockAcquisition;
+
 /// Unix file-based exclusive lock.
 #[derive(Debug)]
 pub(crate) struct OsLock {
@@ -29,19 +31,21 @@ impl OsLock {
     }
 
     /// Block until the exclusive lock is acquired.
-    pub(crate) fn lock(&self) -> io::Result<()> {
-        self.file.lock()
+    pub(crate) fn lock(&self) -> io::Result<LockAcquisition> {
+        self.file.lock()?;
+        Ok(LockAcquisition::Normal)
     }
 
     /// Attempt a non-blocking acquire.
     ///
     /// Returns `Err` with [`io::ErrorKind::WouldBlock`] when the lock is held
     /// by another process.
-    pub(crate) fn try_lock(&self) -> io::Result<()> {
+    pub(crate) fn try_lock(&self) -> io::Result<LockAcquisition> {
         self.file.try_lock().map_err(|e| match e {
             TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
             TryLockError::Error(e) => e,
-        })
+        })?;
+        Ok(LockAcquisition::Normal)
     }
 
     /// Release the lock.

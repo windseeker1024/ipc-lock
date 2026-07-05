@@ -5,6 +5,7 @@
 
 use std::io;
 
+use crate::sys::LockAcquisition;
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -33,12 +34,14 @@ impl OsLock {
 
     /// Block until the mutex is acquired.
     ///
-    /// Abandoned mutexes are treated as successfully acquired; the previous
-    /// owner terminated without releasing.
-    pub(crate) fn lock(&self) -> io::Result<()> {
+    /// Returns [`LockAcquisition::Abandoned`] when the previous owner terminated
+    /// without releasing the mutex.
+    pub(crate) fn lock(&self) -> io::Result<LockAcquisition> {
         let rc = unsafe { WaitForSingleObject(self.handle, INFINITE) };
-        if rc == WAIT_OBJECT_0 || rc == WAIT_ABANDONED {
-            Ok(())
+        if rc == WAIT_OBJECT_0 {
+            Ok(LockAcquisition::Normal)
+        } else if rc == WAIT_ABANDONED {
+            Ok(LockAcquisition::Abandoned)
         } else {
             Err(io::Error::last_os_error())
         }
@@ -47,11 +50,14 @@ impl OsLock {
     /// Attempt a non-blocking acquire.
     ///
     /// Returns `Err` with [`io::ErrorKind::WouldBlock`] when the mutex is held.
-    /// Abandoned mutexes are treated as successfully acquired.
-    pub(crate) fn try_lock(&self) -> io::Result<()> {
+    /// Returns [`LockAcquisition::Abandoned`] when the previous owner terminated
+    /// without releasing the mutex.
+    pub(crate) fn try_lock(&self) -> io::Result<LockAcquisition> {
         let rc = unsafe { WaitForSingleObject(self.handle, 0) };
-        if rc == WAIT_OBJECT_0 || rc == WAIT_ABANDONED {
-            Ok(())
+        if rc == WAIT_OBJECT_0 {
+            Ok(LockAcquisition::Normal)
+        } else if rc == WAIT_ABANDONED {
+            Ok(LockAcquisition::Abandoned)
         } else if rc == WAIT_TIMEOUT {
             Err(io::Error::from(io::ErrorKind::WouldBlock))
         } else {

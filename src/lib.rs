@@ -12,6 +12,9 @@
 //! 1. **OS-level** — keeps different *processes* out.
 //!    - Unix: `flock(2)` via [`std::fs::File::lock`] on a file under `$TMPDIR`.
 //!    - Windows: a `Global\` named kernel mutex via `CreateMutexW`.
+//!      If the previous owner terminates without releasing the mutex, the
+//!      next waiter acquires it successfully but [`LockGuard::is_abandoned`]
+//!      returns `true`.
 //!
 //! 2. **Thread-level** — keeps different threads in the same process from
 //!    entering concurrently, because `flock` and `CreateMutexW` are
@@ -99,6 +102,10 @@ fn validate_name(name: &str) -> Result<()> {
 struct LockState {
     /// The underlying OS lock (file or named mutex).
     os: sys::OsLock,
+    /// The canonical OS-level identifier for this lock. Kept here so
+    /// [`Lock::path`] can return it on Unix.
+    #[cfg(unix)]
+    key: Key,
     /// `true` while a [`LockGuard`] for this state exists in this process.
     held: Mutex<bool>,
     /// Notified when `held` transitions from `true` to `false`.
@@ -143,6 +150,8 @@ fn registry_get_or_create(
     let os = create(&key).map_err(Error::Io)?;
     let state = Arc::new(LockState {
         os,
+        #[cfg(unix)]
+        key: key.clone(),
         held: Mutex::new(false),
         released: Condvar::new(),
     });
@@ -207,6 +216,19 @@ impl Lock {
         Ok(Lock { state })
     }
 
+    /// Return the filesystem path of the backing lock file (Unix only).
+    ///
+    /// This is the path used by [`Lock::new`] or [`Lock::with_path`]. It can be
+    /// used by callers to clean up the lock file when they know it is safe to do
+    /// so. The library itself intentionally leaves the file in place; deleting it
+    /// while another process may still be using the lock can break mutual
+    /// exclusion.
+    #[cfg(unix)]
+    #[cfg_attr(docsrs, doc(cfg(unix)))]
+    pub fn path(&self) -> &Path {
+        &self.state.key
+    }
+
     /// Acquire the lock, **blocking** until it is available.
     ///
     /// Returns a [`LockGuard`] that releases the lock when dropped.
@@ -265,7 +287,10 @@ fn acquire(state: Arc<LockState>, blocking: bool) -> Result<LockGuard> {
     };
 
     match os_result {
-        Ok(()) => Ok(LockGuard { state }),
+        Ok(acquisition) => Ok(LockGuard {
+            state,
+            abandoned: acquisition == sys::LockAcquisition::Abandoned,
+        }),
 
         Err(e) => {
             // Release the thread gate so waiting threads can retry.
@@ -289,8 +314,28 @@ fn acquire(state: Arc<LockState>, blocking: bool) -> Result<LockGuard> {
 /// Releases the lock — both the OS primitive and the thread gate — when
 /// dropped.  The guard keeps the [`Lock`]'s backing state alive, so it is
 /// safe to drop the originating `Lock` while the guard is still live.
+///
+/// On Windows, if the previous mutex owner terminated without releasing the
+/// lock, the waiting acquisition succeeds but [`LockGuard::is_abandoned`]
+/// returns `true`. This can indicate that shared state protected by the lock
+/// may be inconsistent. On Unix this method always returns `false`.
 pub struct LockGuard {
     state: Arc<LockState>,
+    abandoned: bool,
+}
+
+impl LockGuard {
+    /// Returns `true` if the lock was acquired from an abandoned owner.
+    ///
+    /// This only happens on Windows when the previous owner of the named
+    /// kernel mutex terminated without releasing the mutex. It signals that
+    /// any shared state protected by the lock may be in an inconsistent
+    /// state and should be inspected before reuse.
+    ///
+    /// On Unix this method always returns `false`.
+    pub fn is_abandoned(&self) -> bool {
+        self.abandoned
+    }
 }
 
 impl Drop for LockGuard {
@@ -308,7 +353,9 @@ impl Drop for LockGuard {
 
 impl fmt::Debug for LockGuard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LockGuard").finish_non_exhaustive()
+        f.debug_struct("LockGuard")
+            .field("abandoned", &self.abandoned)
+            .finish_non_exhaustive()
     }
 }
 
@@ -760,5 +807,93 @@ mod tests {
 
         let _ = std::fs::remove_file(&expected_path);
         Ok(())
+    }
+
+    /// Unix-only: `Lock::path` returns the backing lock file path.
+    #[cfg(unix)]
+    #[test]
+    fn unix_lock_path() -> Result<()> {
+        let name = random_name();
+        let expected_path = std::env::var_os("TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(format!("{name}.lock"));
+
+        let lock = Lock::new(&name)?;
+        assert_eq!(lock.path(), expected_path);
+
+        let custom_path =
+            std::env::temp_dir().join(format!("ipc-lock-path-test-{}", random_name()));
+        let lock_with_path = Lock::with_path(&custom_path)?;
+        assert_eq!(lock_with_path.path(), custom_path);
+
+        let _ = std::fs::remove_file(&expected_path);
+        let _ = std::fs::remove_file(&custom_path);
+        Ok(())
+    }
+
+    /// A normal acquisition is never reported as abandoned.
+    #[test]
+    fn abandoned_false_for_normal_lock() -> Result<()> {
+        let lock = Lock::new(&random_name())?;
+        let guard = lock.lock()?;
+        assert!(
+            !guard.is_abandoned(),
+            "normal acquisition should not be abandoned"
+        );
+        Ok(())
+    }
+
+    /// Windows-only: acquiring a mutex whose previous owner aborted reports
+    /// `is_abandoned() == true`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_abandoned_lock() -> Result<()> {
+        let proc_num: u32 = env::var("IPC_LOCK_TEST_ABANDON_PROC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let uuid = env::var("IPC_LOCK_TEST_ABANDON_UUID").unwrap_or_else(|_| random_name());
+
+        match proc_num {
+            0 => {
+                // Parent: open the mutex first so it survives the child's death,
+                // then spawn the child, wait for it to abort, and re-acquire.
+                let _lock = Lock::new(&uuid)?;
+                let mut child = spawn_abandon_subprocess(&uuid);
+                let status = child.wait().expect("child wait failed");
+                assert!(
+                    !status.success(),
+                    "child process should have aborted without releasing the lock"
+                );
+
+                let lock = Lock::new(&uuid)?;
+                let guard = lock.lock()?;
+                assert!(
+                    guard.is_abandoned(),
+                    "expected abandoned mutex after child aborted"
+                );
+            }
+            1 => {
+                // Child: acquire the lock and abort without releasing.
+                let lock = Lock::new(&uuid).expect("child failed to create lock");
+                let _guard = lock.lock().expect("child failed to acquire lock");
+                std::process::abort();
+            }
+            _ => unreachable!(),
+        }
+
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn spawn_abandon_subprocess(uuid: &str) -> Child {
+        let exe = env::current_exe().expect("could not locate test binary");
+        Command::new(exe)
+            .env("IPC_LOCK_TEST_ABANDON_PROC", "1")
+            .env("IPC_LOCK_TEST_ABANDON_UUID", uuid)
+            .arg("tests::windows_abandoned_lock")
+            .spawn()
+            .expect("failed to spawn abandon subprocess")
     }
 }
