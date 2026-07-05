@@ -55,6 +55,33 @@ assert!(other.try_lock().is_err()); // WouldBlock
 On Unix the lock file is placed at `$TMPDIR/<name>.lock` (falling back to
 `/tmp/<name>.lock`).  Use [`Lock::with_path`] to specify an exact path.
 
+## Platform notes
+
+### Unix lock-file cleanup
+
+The library intentionally leaves the lock file in place after the lock is
+released. You can retrieve the path with [`Lock::path`] and delete it when you
+know no other process is using the lock:
+
+```rust
+let lock = Lock::new("my-app")?;
+// ... use the lock ...
+let path = lock.path().to_owned();
+drop(lock);
+std::fs::remove_file(path)?;
+```
+
+Deleting the file while another process may still be using the lock can break
+mutual exclusion, because a new process would create a fresh file at the same
+path.
+
+### Windows abandoned mutexes
+
+If a Windows process terminates without releasing the named mutex, the next
+waiter still acquires the lock successfully, but
+[`LockGuard::is_abandoned()`] returns `true`. This signals that any shared
+state protected by the lock may be inconsistent.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

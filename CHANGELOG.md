@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-05
+
+### Added
+
+- Added `LockGuard::is_abandoned()` to report when a Windows named mutex was
+  acquired from an owner that terminated without releasing it.
+- Added `Lock::path()` (Unix only) to retrieve the filesystem path of the
+  backing lock file, useful for manual cleanup.
+
 ## [0.1.2] - 2026-07-05
 
 ### Fixed
