@@ -91,6 +91,9 @@ fn key_from_name(name: &str) -> Key {
 ///
 /// The scope is part of the mutex identity: two locks with the same name but
 /// different scopes are independent of each other.
+///
+/// [`Display`](fmt::Display) renders the bare namespace name (`Global` or
+/// `Local`).
 #[cfg(windows)]
 #[cfg_attr(docsrs, doc(cfg(windows)))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -103,13 +106,13 @@ pub enum Scope {
 }
 
 #[cfg(windows)]
-impl Scope {
-    /// Return the Win32 namespace prefix for this scope.
-    fn prefix(self) -> &'static str {
-        match self {
-            Scope::Global => "Global\\",
-            Scope::Local => "Local\\",
-        }
+impl fmt::Display for Scope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let namespace = match self {
+            Scope::Global => "Global",
+            Scope::Local => "Local",
+        };
+        f.write_str(namespace)
     }
 }
 
@@ -117,7 +120,9 @@ impl Scope {
 /// name and namespace `scope`.
 #[cfg(windows)]
 fn key_from_name(name: &str, scope: Scope) -> Key {
-    format!("{}{name}", scope.prefix())
+    // `Scope`'s `Display` renders the bare namespace name; the trailing
+    // backslash separating the namespace from the object name is added here.
+    format!("{scope}\\{name}")
 }
 
 // ── Validation ────────────────────────────────────────────────────────────────
@@ -910,6 +915,14 @@ mod tests {
             "normal acquisition should not be abandoned"
         );
         Ok(())
+    }
+
+    /// Windows-only: `Scope` renders its bare namespace name via `Display`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_scope_display() {
+        assert_eq!(Scope::Global.to_string(), "Global");
+        assert_eq!(Scope::Local.to_string(), "Local");
     }
 
     /// Windows-only: `Lock::new` and an explicit `Scope::Global` lock share
