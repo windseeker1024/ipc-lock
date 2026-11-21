@@ -17,7 +17,7 @@ contained in a small, scoped module.
 | Platform | Mechanism |
 |---|---|
 | Unix (Linux, macOS, …) | `flock(2)` via `std::fs::File::lock()` |
-| Windows | `CreateMutexW` (kernel named mutex, `Global\` namespace) |
+| Windows | `CreateMutexW` (kernel named mutex, `Global\` by default) |
 
 ## Usage
 
@@ -74,6 +74,22 @@ std::fs::remove_file(path)?;
 Deleting the file while another process may still be using the lock can break
 mutual exclusion, because a new process would create a fresh file at the same
 path.
+
+### Windows mutex scope
+
+By default a Windows lock uses the `Global\` namespace, so it is shared across
+every logon session on the machine. Use [`Lock::with_scope`] to place the
+kernel mutex in the `Local\` (session-only) namespace instead:
+
+```rust
+use ipc_lock::{Lock, Scope};
+
+let lock = Lock::with_scope("my-app", Scope::Local)?;
+```
+
+Locks that share a name but use different scopes are independent kernel
+objects. `Lock::new(name)` is equivalent to
+`Lock::with_scope(name, Scope::Global)`.
 
 ### Windows abandoned mutexes
 

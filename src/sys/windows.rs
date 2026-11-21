@@ -1,7 +1,8 @@
 //! Windows implementation: wraps a named kernel mutex (`CreateMutexW`).
 //!
-//! The mutex is created in the `Global\` namespace so it is visible across
-//! all user sessions on the machine.
+//! The kernel-object namespace (`Global\` or `Local\`) is part of the mutex
+//! name handed to `CreateMutexW`; the caller selects it through
+//! [`crate::Scope`].
 
 use std::io;
 
