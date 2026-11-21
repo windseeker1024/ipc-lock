@@ -11,10 +11,12 @@
 //!
 //! 1. **OS-level** — keeps different *processes* out.
 //!    - Unix: `flock(2)` via [`std::fs::File::lock`] on a file under `$TMPDIR`.
-//!    - Windows: a `Global\` named kernel mutex via `CreateMutexW`.
-//!      If the previous owner terminates without releasing the mutex, the
-//!      next waiter acquires it successfully but [`LockGuard::is_abandoned`]
-//!      returns `true`.
+//!    - Windows: a named kernel mutex via `CreateMutexW`. By default it lives
+//!      in the `Global\` namespace so it is visible across all logon sessions;
+//!      `Lock::with_scope` selects the `Local\` (session-only) namespace
+//!      instead. If the previous owner terminates without releasing the mutex,
+//!      the next waiter acquires it successfully but
+//!      [`LockGuard::is_abandoned`] returns `true`.
 //!
 //! 2. **Thread-level** — keeps different threads in the same process from
 //!    entering concurrently, because `flock` and `CreateMutexW` are
@@ -61,7 +63,8 @@ pub use error::{Error, Result};
 // ── Platform key type ─────────────────────────────────────────────────────────
 //
 // The registry key is the canonical OS-level identifier for the lock.
-// On Unix it is the full path to the lock file; on Windows the mutex name.
+// On Unix it is the full path to the lock file; on Windows the fully qualified
+// mutex name including its namespace prefix.
 
 #[cfg(unix)]
 type Key = PathBuf;
@@ -77,9 +80,49 @@ fn key_from_name(name: &str) -> Key {
         .join(format!("{name}.lock"))
 }
 
+/// Windows namespace in which a named kernel mutex is created.
+///
+/// Windows named kernel objects live in one of two namespaces:
+///
+/// * [`Scope::Global`] — the `Global\` namespace, visible to every logon
+///   session on the machine. This is the default used by [`Lock::new`].
+/// * [`Scope::Local`] — the `Local\` namespace, visible only to the current
+///   logon session.
+///
+/// The scope is part of the mutex identity: two locks with the same name but
+/// different scopes are independent of each other.
+///
+/// [`Display`](fmt::Display) renders the bare namespace name (`Global` or
+/// `Local`).
 #[cfg(windows)]
-fn key_from_name(name: &str) -> Key {
-    format!("Global\\{name}")
+#[cfg_attr(docsrs, doc(cfg(windows)))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Scope {
+    /// `Global\` — shared across all logon sessions on the machine.
+    #[default]
+    Global,
+    /// `Local\` — private to the current logon session.
+    Local,
+}
+
+#[cfg(windows)]
+impl fmt::Display for Scope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let namespace = match self {
+            Scope::Global => "Global",
+            Scope::Local => "Local",
+        };
+        f.write_str(namespace)
+    }
+}
+
+/// Derive the OS-level key (a fully qualified mutex name) from a user-supplied
+/// name and namespace `scope`.
+#[cfg(windows)]
+fn key_from_name(name: &str, scope: Scope) -> Key {
+    // `Scope`'s `Display` renders the bare namespace name; the trailing
+    // backslash separating the namespace from the object name is added here.
+    format!("{scope}\\{name}")
 }
 
 // ── Validation ────────────────────────────────────────────────────────────────
@@ -183,7 +226,9 @@ impl Lock {
     ///
     /// * **Unix** — creates/opens `$TMPDIR/<name>.lock` (falls back to
     ///   `/tmp/<name>.lock` when `TMPDIR` is unset).
-    /// * **Windows** — creates/opens a kernel mutex named `Global\<name>`.
+    /// * **Windows** — creates/opens a kernel mutex in the `Global\`
+    ///   namespace named `Global\<name>`. Use `Lock::with_scope` to select the
+    ///   `Local\` namespace instead.
     ///
     /// # Errors
     ///
@@ -191,11 +236,39 @@ impl Lock {
     /// the OS operation fails.
     pub fn new(name: &str) -> Result<Self> {
         validate_name(name)?;
+        #[cfg(windows)]
+        let key = key_from_name(name, Scope::Global);
+        #[cfg(unix)]
         let key = key_from_name(name);
         // `key` is only borrowed by the closure. On the fast path an existing
         // live state is returned and `key` remains owned by this function; on
         // the slow path the closure borrows it and ownership then moves into
         // the registry.
+        let state = registry_get_or_create(key, |k| sys::OsLock::open(k))?;
+        Ok(Lock { state })
+    }
+
+    /// Open (or create) a named lock in an explicit Windows namespace scope.
+    ///
+    /// [`Lock::new`] always uses [`Scope::Global`]. Use this constructor to
+    /// place the mutex in the [`Scope::Local`] namespace so it is visible only
+    /// to the current logon session, or to make the [`Scope::Global`] choice
+    /// explicit.
+    ///
+    /// Locks created with different scopes are fully independent, even when
+    /// they share the same `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidName`] for illegal names, or [`Error::Io`] if
+    /// the OS operation fails.
+    #[cfg(windows)]
+    #[cfg_attr(docsrs, doc(cfg(windows)))]
+    pub fn with_scope(name: &str, scope: Scope) -> Result<Self> {
+        validate_name(name)?;
+        let key = key_from_name(name, scope);
+        // `key` is borrowed by the closure on the slow path and moved into the
+        // registry afterwards; see `new` for details.
         let state = registry_get_or_create(key, |k| sys::OsLock::open(k))?;
         Ok(Lock { state })
     }
@@ -841,6 +914,62 @@ mod tests {
             !guard.is_abandoned(),
             "normal acquisition should not be abandoned"
         );
+        Ok(())
+    }
+
+    /// Windows-only: `Scope` renders its bare namespace name via `Display`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_scope_display() {
+        assert_eq!(Scope::Global.to_string(), "Global");
+        assert_eq!(Scope::Local.to_string(), "Local");
+    }
+
+    /// Windows-only: `Lock::new` and an explicit `Scope::Global` lock share
+    /// the same underlying mutex.
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_scope_is_global() -> Result<()> {
+        let name = random_name();
+        let default = Lock::new(&name)?;
+        let explicit = Lock::with_scope(&name, Scope::Global)?;
+
+        let _guard = default.lock()?;
+        assert!(
+            matches!(explicit.try_lock(), Err(Error::WouldBlock)),
+            "default and explicit Global scope should reference the same lock"
+        );
+        Ok(())
+    }
+
+    /// Windows-only: two `Scope::Local` locks with the same name share state.
+    #[cfg(windows)]
+    #[test]
+    fn windows_local_scope_shares_state() -> Result<()> {
+        let name = random_name();
+        let a = Lock::with_scope(&name, Scope::Local)?;
+        let b = Lock::with_scope(&name, Scope::Local)?;
+
+        let _guard = a.lock()?;
+        assert!(
+            matches!(b.try_lock(), Err(Error::WouldBlock)),
+            "two Local locks with the same name should share state"
+        );
+        Ok(())
+    }
+
+    /// Windows-only: `Global` and `Local` locks with the same name are
+    /// independent kernel objects and must not block each other.
+    #[cfg(windows)]
+    #[test]
+    fn windows_scopes_are_independent() -> Result<()> {
+        let name = random_name();
+        let global = Lock::with_scope(&name, Scope::Global)?;
+        let local = Lock::with_scope(&name, Scope::Local)?;
+
+        let _global_guard = global.lock()?;
+        // A lock in a different namespace must not observe the Global lock.
+        let _local_guard = local.try_lock()?;
         Ok(())
     }
 

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Windows: `Scope` enum and `Lock::with_scope()` to choose the kernel-mutex
+  namespace — `Scope::Global` (the default, visible across all logon sessions)
+  or `Scope::Local` (visible only to the current logon session). `Lock::new()`
+  keeps using the `Global\` namespace, preserving existing behaviour.
+
 ## [0.1.4] - 2026-07-05
 
 ### Added
